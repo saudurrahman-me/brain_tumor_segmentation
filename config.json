@@ -1,0 +1,17 @@
+{
+  "target_shape": [128, 128, 128],
+  "modalities": ["t1", "t1ce", "t2", "flair"],
+  "class_labels": {
+    "0": "background",
+    "1": "necrotic_or_non_enhancing_core",
+    "2": "edema",
+    "3": "enhancing_tumor"
+  },
+  "brats_label_mapping": {"0": 0, "1": 1, "2": 2, "4": 3},
+  "train_validation_test_split": [0.7, 0.15, 0.15],
+  "random_seed": 42,
+  "base_filters": 16,
+  "batch_size": 1,
+  "learning_rate": 0.0001,
+  "epochs": 50
+}

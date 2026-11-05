@@ -1,155 +1,161 @@
+"""Load, align, normalize, and resize multimodal brain MRI volumes.
 
-# File 2: utils/mri_preprocessing.py - Handles loading and preparing MRI scans
-# preprocessing_code =
+The output grid preserves the reference image's physical field of view and affine.
+BraTS-style labels are retained here; remapping is handled by the data generator.
 """
-MRI Data Preprocessing Module
-This file handles loading MRI scans and preparing them for the AI model
-"""
+from __future__ import annotations
 
-import numpy as np
-import nibabel as nib  # For reading NIfTI MRI files (.nii.gz)
 import os
-import glob
-from scipy import ndimage
+import re
+from typing import Dict, Optional, Sequence
+
+import nibabel as nib
+import numpy as np
+from nibabel.processing import resample_from_to
+
 
 class MRIPreprocessor:
-    """
-    This class loads and preprocesses MRI brain scans
-    
-    What it does:
-    1. Loads 4 types of MRI scans (T1, T1ce, T2, FLAIR)
-    2. Normalizes the image brightness
-    3. Resizes images to standard size
-    4. Combines all 4 scans into one array
-    """
-    
-    def __init__(self, target_shape=(128, 128, 128)):
-        """
-        Initialize the preprocessor
-        
-        target_shape: The size we want all images to be (default 128x128x128)
-        """
-        self.target_shape = target_shape
-        self.modalities = ['t1', 't1ce', 't2', 'flair']
-    
-    def load_nifti_file(self, file_path):
-        """
-        Load a single MRI file (.nii.gz format)
-        
-        Returns: 3D numpy array of the brain scan
-        """
-        try:
-            nifti_img = nib.load(file_path)
-            data = nifti_img.get_fdata()
-            return data
-        except Exception as e:
-            print(f"Error loading {file_path}: {e}")
-            return None
-    
-    def normalize_intensity(self, image, method='z-score'):
-        """
-        Normalize image brightness to standard range
-        
-        z-score: Makes mean=0, std=1 (good for AI models)
-        """
-        if method == 'z-score':
-            mean = np.mean(image)
-            std = np.std(image)
-            if std != 0:
-                return (image - mean) / std
-            return image - mean
-        return image
-    
-    def resize_volume(self, volume, target_shape=None, order=1):
-        """
-        Resize 3D volume to target size
-        
-        order=1: Linear interpolation (smooth)
-        order=0: Nearest neighbor (for masks, preserves labels)
-        """
-        if target_shape is None:
-            target_shape = self.target_shape
-        
-        if volume.shape == target_shape:
-            return volume
-        
-        # Calculate zoom factors for each dimension
-        factors = [t / c for t, c in zip(target_shape, volume.shape)]
-        resized = ndimage.zoom(volume, factors, order=order)
-        return resized
-    
-    def preprocess_patient_data(self, patient_dir):
-        """
-        Load all 4 MRI scans for one patient
-        
-        patient_dir: Folder containing the MRI files
-        Returns: Dictionary with all 4 modalities
-        """
-        data = {}
-        
-        # File patterns to look for (different datasets use different naming)
-        file_patterns = {
-            't1': ['*_t1.nii*', '*_t1n.nii*'],
-            't1ce': ['*_t1ce.nii*', '*_t1c.nii*'],
-            't2': ['*_t2.nii*', '*_t2w.nii*'],
-            'flair': ['*_flair.nii*', '*_t2f.nii*', '*_fla.nii*'],
-            'seg': ['*_seg.nii*']
+    """Preprocess T1, T1ce, T2, FLAIR and optional segmentation NIfTI files."""
+
+    MODALITY_ALIASES = {
+        "t1": ("t1", "t1n"),
+        "t1ce": ("t1ce", "t1c", "t1gd"),
+        "t2": ("t2", "t2w"),
+        "flair": ("flair", "t2f", "fla"),
+        "seg": ("seg", "mask"),
+    }
+    REQUIRED_MODALITIES = ("t1", "t1ce", "t2", "flair")
+
+    def __init__(self, target_shape: Sequence[int] = (128, 128, 128)):
+        self.target_shape = tuple(int(v) for v in target_shape)
+        if len(self.target_shape) != 3 or any(v <= 0 for v in self.target_shape):
+            raise ValueError("target_shape must contain three positive integers")
+        self.modalities = list(self.REQUIRED_MODALITIES)
+        self.last_affine: Optional[np.ndarray] = None
+        self.last_header = None
+        self.voxel_spacing_mm: Optional[tuple] = None
+        self.loaded_paths: Dict[str, str] = {}
+
+    @staticmethod
+    def _is_nifti(filename: str) -> bool:
+        lower = filename.lower()
+        return lower.endswith(".nii") or lower.endswith(".nii.gz")
+
+    @classmethod
+    def _matches_alias(cls, filename: str, aliases: Sequence[str]) -> bool:
+        stem = filename.lower()
+        if stem.endswith(".nii.gz"):
+            stem = stem[:-7]
+        elif stem.endswith(".nii"):
+            stem = stem[:-4]
+        for alias in aliases:
+            if re.search(r"(?:^|[_-])" + re.escape(alias) + r"(?:$|[_-])", stem):
+                return True
+        return False
+
+    def find_patient_files(self, patient_dir: str) -> Dict[str, str]:
+        if not os.path.isdir(patient_dir):
+            raise FileNotFoundError(f"Patient directory does not exist: {patient_dir}")
+        files = sorted(
+            os.path.join(patient_dir, name)
+            for name in os.listdir(patient_dir)
+            if self._is_nifti(name) and os.path.isfile(os.path.join(patient_dir, name))
+        )
+        found: Dict[str, str] = {}
+        for modality, aliases in self.MODALITY_ALIASES.items():
+            matches = [
+                path for path in files
+                if self._matches_alias(os.path.basename(path), aliases)
+            ]
+            if matches:
+                if len(matches) > 1:
+                    # Prefer the shortest, most explicit filename deterministically.
+                    matches.sort(key=lambda p: (len(os.path.basename(p)), os.path.basename(p)))
+                found[modality] = matches[0]
+        missing = [name for name in self.REQUIRED_MODALITIES if name not in found]
+        if missing:
+            raise FileNotFoundError(
+                f"Missing required MRI modality/mod modalities in {patient_dir}: "
+                + ", ".join(missing)
+            )
+        self.loaded_paths = found
+        return found
+
+    @staticmethod
+    def normalize_intensity(image: np.ndarray) -> np.ndarray:
+        """Z-score non-zero voxels so background zeros remain zero."""
+        image = np.asarray(image, dtype=np.float32)
+        finite = np.isfinite(image)
+        foreground = finite & (image != 0)
+        if not np.any(foreground):
+            raise ValueError("MRI volume contains no finite non-zero voxels")
+        values = image[foreground]
+        mean = float(values.mean())
+        std = float(values.std())
+        output = np.zeros_like(image, dtype=np.float32)
+        if std > 1e-8:
+            output[foreground] = (values - mean) / std
+        else:
+            output[foreground] = values - mean
+        return output
+
+    def _target_grid(self, reference_img):
+        """Build a resized grid with the same physical field of view."""
+        source_shape = np.asarray(reference_img.shape[:3], dtype=np.float64)
+        target_shape = np.asarray(self.target_shape, dtype=np.int32)
+        scale = source_shape / target_shape
+        voxel_transform = np.eye(4, dtype=np.float64)
+        voxel_transform[:3, :3] = np.diag(scale)
+        voxel_transform[:3, 3] = (scale - 1.0) / 2.0
+        target_affine = reference_img.affine @ voxel_transform
+        return tuple(int(v) for v in target_shape), target_affine
+
+    def preprocess_patient_data(self, patient_dir: str) -> Dict[str, np.ndarray]:
+        """Return aligned float32 modalities and an optional uint8 segmentation."""
+        paths = self.find_patient_files(patient_dir)
+        images = {
+            name: nib.as_closest_canonical(nib.load(paths[name]))
+            for name in self.REQUIRED_MODALITIES
         }
-        
-        for modality, patterns in file_patterns.items():
-            # Try each pattern until we find a file
-            for pattern in patterns:
-                search_path = os.path.join(patient_dir, pattern)
-                files = glob.glob(search_path)
-                
-                if files:
-                    # Found a file, load it
-                    volume = self.load_nifti_file(files[0])
-                    if volume is not None:
-                        # Normalize and resize
-                        volume = self.normalize_intensity(volume)
-                        volume = self.resize_volume(volume, self.target_shape)
-                        data[modality] = volume
-                        break
-        
+        reference = images["t1"]
+        if len(reference.shape) != 3:
+            raise ValueError(f"T1 image must be 3D, got shape {reference.shape}")
+        target = self._target_grid(reference)
+        data: Dict[str, np.ndarray] = {}
+
+        for modality in self.REQUIRED_MODALITIES:
+            image = images[modality]
+            if len(image.shape) != 3:
+                raise ValueError(f"{modality} image must be 3D, got shape {image.shape}")
+            aligned = resample_from_to(image, target, order=1)
+            data[modality] = self.normalize_intensity(aligned.get_fdata(dtype=np.float32))
+
+        if "seg" in paths:
+            seg_img = nib.as_closest_canonical(nib.load(paths["seg"]))
+            if len(seg_img.shape) != 3:
+                raise ValueError(f"Segmentation must be 3D, got shape {seg_img.shape}")
+            aligned_seg = resample_from_to(seg_img, target, order=0)
+            seg = np.rint(aligned_seg.get_fdata(dtype=np.float32)).astype(np.int16)
+            labels = set(np.unique(seg).tolist())
+            unsupported = labels - {0, 1, 2, 3, 4}
+            if unsupported:
+                raise ValueError(f"Unsupported segmentation labels: {sorted(unsupported)}")
+            data["seg"] = seg.astype(np.uint8)
+
+        self.last_affine = np.asarray(target[1], dtype=np.float64)
+        self.last_header = reference.header.copy()
+        self.last_header.set_data_shape(self.target_shape)
+        self.last_header.set_data_dtype(np.uint8)
+        self.voxel_spacing_mm = tuple(float(v) for v in nib.affines.voxel_sizes(self.last_affine))
         return data
-    
-    def create_multimodal_input(self, data):
-        """
-        Stack all 4 MRI types into one array
-        
-        Input: Dictionary with t1, t1ce, t2, flair
-        Output: Array of shape (H, W, D, 4) - 4 channels for 4 MRI types
-        """
-        modalities_list = []
-        
-        for mod in ['t1', 't1ce', 't2', 'flair']:
-            if mod in data:
-                modalities_list.append(data[mod])
-        
-        if len(modalities_list) == 0:
-            raise ValueError("No MRI files found!")
-        
-        # Stack along the last dimension (channels)
-        multimodal = np.stack(modalities_list, axis=-1)
-        return multimodal
 
-# Example usage
-if __name__ == "__main__":
-    # Create preprocessor
-    preprocessor = MRIPreprocessor(target_shape=(128, 128, 128))
-    
-    print("MRI Preprocessor ready!")
-    print(f"Target shape: {preprocessor.target_shape}")
-    print(f"Modalities: {preprocessor.modalities}")
-
-
-with open('/mnt/kimi/output/brain_tumor_segmentation/utils/mri_preprocessing.py', 'w') as f:
-    f.write(preprocessing_code)
-
-print("✅ Created: utils/mri_preprocessing.py")
-print("\nThis file handles:")
-print("  - Loading .nii.gz MRI files")
-print("  - Normalizing image brightness")
-print("  - Resizing to 128x128x128")
-print("  - Combining 4 MRI types into one array")
+    def create_multimodal_input(self, data: Dict[str, np.ndarray]) -> np.ndarray:
+        missing = [name for name in self.REQUIRED_MODALITIES if name not in data]
+        if missing:
+            raise ValueError("Missing MRI modalities: " + ", ".join(missing))
+        arrays = [np.asarray(data[name], dtype=np.float32) for name in self.REQUIRED_MODALITIES]
+        expected = self.target_shape
+        for name, array in zip(self.REQUIRED_MODALITIES, arrays):
+            if array.shape != expected:
+                raise ValueError(f"{name} has shape {array.shape}; expected {expected}")
+        return np.stack(arrays, axis=-1).astype(np.float32, copy=False)
